@@ -28,11 +28,16 @@ class DockerExecutor:
             result.returncode == 0 and result.stdout.strip() == "true"
         )
 
-    def create(self, container_name, workspace):
+    def create(self, container_name, workspace, kaggle):
         workspace = Path(workspace).resolve()
 
         if not workspace.is_dir():
             raise NotADirectoryError(str(workspace))
+
+        kaggle = Path(kaggle).resolve()
+
+        if not kaggle.is_dir():
+            raise NotADirectoryError(str(kaggle))
 
         return self._run([
             "run",
@@ -60,6 +65,10 @@ class DockerExecutor:
             # bind mount folder so we can read and write the mount folder even in the sandbox
             "--mount",
             f"type=bind,source={workspace},target=/deliverables",
+
+
+            "--mount",
+            f"type=bind,source={kaggle},target=/kaggle_sandbox",
 
             "--workdir", "/deliverables",
             self.image,

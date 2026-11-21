@@ -9,6 +9,8 @@ from prompt.registry import PromptRegistry
 from prompt.render import render_prompt
 from context.trajectory import _construct_trajectory
 from tools.sandbox.model import ToolContext
+from tools.training_orchestrator.kaggle_executor import KernelExecutor, ModelExecutor, DatasetExecutor
+from tools.training_orchestrator.kaggle_manager import KaggleManager
 from tools.sandbox.manager import SandboxManager
 from tools.host.file_system import HostFilesystem
 
@@ -97,25 +99,53 @@ def run_task(
     deliverables_dir = task_dir / "deliverables"
     deliverables_dir.mkdir(parents=True, exist_ok=True)
 
+    # create kaggle sandbox dir inside deliverables
+    kaggle_sandbox_dir = task_dir / "kaggle_sandbox"
+    kaggle_sandbox_dir.mkdir(parents=True, exist_ok=True)
+
     # render prompt
     render_dict["deliverables_dir"] = str(deliverables_dir)
+    render_dict["kaggle_sandbox_dir"] = str(kaggle_sandbox_dir)
 
+    # Tool context preparation
     host_system = HostFilesystem(
-        allowed_roots_read=[root], allowed_roots_write=[deliverables_dir])
+        allowed_roots_read=[root], allowed_roots_write=[deliverables_dir, kaggle_sandbox_dir])
     sandbox_manager = SandboxManager()
+
+    # Kaggle executors init
+    kaggle_id = task_dir.parent.name
+    kernel_executor = KernelExecutor(
+        kernel_path=kaggle_sandbox_dir, output_path=kaggle_sandbox_dir / "output", kernel_id=f"nbtailee22/{kaggle_id}")
+
+    dataset_path = Path(kaggle_sandbox_dir / "dataset")
+    dataset_path.mkdir(parents=True, exist_ok=True)
+    dataset_executor = DatasetExecutor(
+        dataset_path=dataset_path, dataset_id=f"nbtailee22/{kaggle_id}-dataset", timeout=6000)
+
+    model_path = Path(kaggle_sandbox_dir / "model")
+    model_path.mkdir(parents=True, exist_ok=True)
+    model_executor = ModelExecutor(
+        model_path=model_path, model_ref=f"nbtailee22/{kaggle_id}-model", timeout=2000)
+
+    kaggle_manager = KaggleManager(
+        kernel_executor,
+        dataset_executor,
+        model_executor
+    )
 
     tool_context = ToolContext(
         run_id=str(name_space),
         deliverables_dir=deliverables_dir,
         sandbox=sandbox_manager,
+        kaggle_manager=kaggle_manager,
         host_filesystem=host_system
-
     )
 
     # start Docker container
     tool_context.sandbox.ensure(
         run_id=tool_context.run_id,
-        workspace=deliverables_dir
+        workspace=deliverables_dir,
+        kaggle=kaggle_sandbox_dir
     )
 
     system_prompt = prompt_registry.get(prompt_name)

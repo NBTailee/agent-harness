@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from tools.training_orchestrator.kaggle_manager import KaggleManager
 from tools.sandbox.manager import SandboxManager
 from tools.host.file_system import HostFilesystem
 
@@ -11,6 +12,7 @@ class ToolContext:
     deliverables_dir: Path
 
     sandbox: SandboxManager
+    kaggle_manager: KaggleManager
     host_filesystem: HostFilesystem
 
 

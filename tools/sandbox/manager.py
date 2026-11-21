@@ -19,13 +19,16 @@ class SandboxManager:
 
         return f"agent-sandbox-{digest}"
 
-    def ensure(self, run_id, workspace):
+    def ensure(self, run_id, workspace, kaggle):
         """
         Ensure that this run has a running container.
         Reuse it if it already exists and is running.
         """
         workspace = Path(workspace).resolve()
         workspace.mkdir(parents=True, exist_ok=True)
+
+        kaggle = Path(kaggle).resolve()
+        kaggle.mkdir(parents=True, exist_ok=True)
 
         container = self._container_name(run_id)
 
@@ -38,6 +41,7 @@ class SandboxManager:
         result = self.docker.create(
             container_name=container,
             workspace=workspace,
+            kaggle=kaggle
         )
 
         if result.returncode != 0:
