@@ -1,4 +1,5 @@
 import re
+import shutil
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from context.trajectory import _construct_trajectory
 from tools.sandbox.model import ToolContext
 from tools.training_orchestrator.kaggle_executor import KernelExecutor, ModelExecutor, DatasetExecutor
 from tools.training_orchestrator.kaggle_manager import KaggleManager
+from tools.registry import MAIN_TOOL_SCHEMAS
+from tools.training_orchestrator.wandb_monitor import WandbMonitor, wandb_enabled
 from tools.sandbox.manager import SandboxManager
 from tools.host.file_system import HostFilesystem
 
@@ -60,7 +63,7 @@ class NameSpace:
         return ns(self.task_id, seed=self.seed, tag=self.tag)
 
     def task_dir(self, root: Path):
-        return Path(root) / "runs" / self.run_id() / self.task_id
+        return Path(root) / "runs" / self.run_id()
 
     def run_id(self):
         current = get_current_time()
@@ -103,9 +106,18 @@ def run_task(
     kaggle_sandbox_dir = task_dir / "kaggle_sandbox"
     kaggle_sandbox_dir.mkdir(parents=True, exist_ok=True)
 
+    # AgentRun and its examples, readable at /kaggle_sandbox; kaggle_push inlines agent_run.py.
+    for name in ("agent_run.py", "agent_run_adapters.py"):
+        shutil.copy(Path(root) / "prompt" / "snippets" / name, kaggle_sandbox_dir / name)
+
     # render prompt
     render_dict["deliverables_dir"] = str(deliverables_dir)
     render_dict["kaggle_sandbox_dir"] = str(kaggle_sandbox_dir)
+    render_dict["wandb_status"] = "enabled" if wandb_enabled() else "disabled"
+    wandb_project = task_dir.name  # run id, e.g. test-wb-26-11-2026_22-13-10
+    render_dict["wandb_project"] = wandb_project
+    render_dict["tools"] = "\n".join(
+        f"- {t['function']['name']}" for t in MAIN_TOOL_SCHEMAS)
 
     # Tool context preparation
     host_system = HostFilesystem(
@@ -113,7 +125,7 @@ def run_task(
     sandbox_manager = SandboxManager()
 
     # Kaggle executors init
-    kaggle_id = task_dir.parent.name
+    kaggle_id = task_dir.name  # task_dir is runs/<run id>
     kernel_executor = KernelExecutor(
         kernel_path=kaggle_sandbox_dir, output_path=kaggle_sandbox_dir / "output", kernel_id=f"nbtailee22/{kaggle_id}")
 
@@ -127,10 +139,22 @@ def run_task(
     model_executor = ModelExecutor(
         model_path=model_path, model_ref=f"nbtailee22/{kaggle_id}-model", timeout=2000)
 
+    # One W&B project per schedule run; every training run of the task goes in it.
+    wandb_monitor = None
+    if wandb_enabled():
+        wandb_monitor = WandbMonitor(project=wandb_project)
+        try:
+            created = wandb_monitor.ensure_project(wandb_project)
+            print(f"[W&B] {'created' if created else 'using'} project {wandb_monitor.path}")
+        except Exception as exc:
+            # W&B also creates the project on the first logged run.
+            print(f"[W&B] could not create project {wandb_project}: {exc}")
+
     kaggle_manager = KaggleManager(
         kernel_executor,
         dataset_executor,
-        model_executor
+        model_executor,
+        wandb_monitor
     )
 
     tool_context = ToolContext(
@@ -151,8 +175,11 @@ def run_task(
     system_prompt = prompt_registry.get(prompt_name)
     system_prompt = render_prompt(system_prompt, render_dict)
 
+    full_history = []  # uncompacted; history.json stays the resumable state
     output = _run_one(MAX_TURNS, system_prompt, task,
-                      resume, context=tool_context)
+                      resume, context=tool_context,
+                      tool_schemas=MAIN_TOOL_SCHEMAS,
+                      transcript=full_history)
 
     # Destroy Docker container
     tool_context.sandbox.destroy(run_id=tool_context.run_id)
@@ -162,6 +189,8 @@ def run_task(
 
     with open(history_dir / "history.json", "w", encoding="utf-8") as f:
         json.dump(output, f, indent=4, ensure_ascii=False)
+    with open(history_dir / "history_full.json", "w", encoding="utf-8") as f:
+        json.dump(full_history, f, indent=4, ensure_ascii=False)
 
     trajectory = _construct_trajectory(output)
 

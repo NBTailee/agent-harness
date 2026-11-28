@@ -20,6 +20,9 @@ def write_todos(todos: list[dict[str, str]]) -> str:
         if not isinstance(task, dict):
             return f"Error: task {i} must be an object."
 
+        if task.get("status") == "completed":
+            task["status"] = "done"
+
         if not isinstance(task.get("content"), str) or not task["content"].strip():
             return f"Error: task {i} must have non-empty string content."
 

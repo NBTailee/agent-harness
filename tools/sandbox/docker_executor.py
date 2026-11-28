@@ -13,6 +13,8 @@ class DockerExecutor:
             input=input_text,
             capture_output=True,
             text=True,
+            encoding="utf-8",  # Windows default codepage breaks on non-ASCII output
+            errors="replace",
             check=False
         )
 

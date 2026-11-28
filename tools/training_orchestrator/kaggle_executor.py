@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import fnmatch
 import subprocess
 import time
@@ -13,6 +14,8 @@ KAGGLE_OWNER = "nbtailee22"
 
 # Keys Kaggle expects as JSON booleans. `kaggle * init` templates write
 # them as the strings "true"/"false", which are truthy in Python.
+# Private dataset (uploaded by the user) holding keys/.env; kernels attach it.
+KEYS_DATASET = f"{KAGGLE_OWNER}/secret-keys"
 BOOL_KEYS = {
     "is_private", "isPrivate",
     "enable_gpu", "enable_tpu", "enable_internet",
@@ -62,6 +65,14 @@ def validate_ref(ref: str, kind: str) -> str:
     return ref
 
 
+def _add_keys_source(metadata: dict) -> None:
+    """Every kernel gets the keys dataset, next to its other sources."""
+    sources = list(metadata.get("dataset_sources") or [])
+    if KEYS_DATASET not in sources:
+        sources.append(KEYS_DATASET)
+    metadata["dataset_sources"] = sources
+
+
 def write_json(path: Path, data: dict, indent: int = 4) -> Path:
     with Path(path).open("w", encoding="utf-8") as file:
         json.dump(data, file, indent=indent, ensure_ascii=False)
@@ -101,6 +112,16 @@ TQDM_RE = re.compile(
     r"(?P<pct>\d{1,3})%\|[^|]*\|\s*(?P<n>\d+)/(?P<total>\d+)\s*"
     r"\[(?P<elapsed>[\d:]+)<(?P<remaining>[\d:]+|\?)"
 )
+# Printed by AgentRun: "PROGRESS step=12/150 elapsed=24.3s"
+AGENT_PROGRESS_RE = re.compile(
+    r"PROGRESS step=(?P<n>\d+)(?:/(?P<total>\d+))? elapsed=(?P<elapsed>[\d.]+)s")
+# Generic script output, e.g. "EPOCH 12/150" or "step: 40/500"
+STEP_LINE_RE = re.compile(
+    r"\b(?:epoch|step|iter(?:ation)?)\s*[:=]?\s*(?P<n>\d+)\s*/\s*(?P<total>\d+)",
+    re.I)
+# Labeled bars that count data, not training steps.
+DATA_BAR_RE = re.compile(
+    r"map|generating|download|filter|token|load|extract|eval|predict", re.I)
 WORKER_STATUS_RE = re.compile(r"KernelWorkerStatus\.(\w+)")
 PLAIN_STATUS_RE = re.compile(r'has status "?(\w+)"?')
 TERMINAL_STATUSES = {"COMPLETE", "ERROR", "CANCELLED", "CANCEL_ACKNOWLEDGED"}
@@ -139,6 +160,30 @@ def log_text(raw: str) -> str:
     return "".join(c if c.endswith("\n") else c + "\n" for c in chunks)
 
 
+def _progress_from_lines(lines: list[str]) -> dict[str, Any]:
+    """Fallback when no tqdm bar reached the log yet."""
+    for line in reversed(lines):
+        match = AGENT_PROGRESS_RE.search(line)
+        if match:
+            n, elapsed = int(match["n"]), float(match["elapsed"])
+            total = int(match["total"]) if match["total"] else None
+            out = {"found": True, "source": "agent_run", "step": n,
+                   "total_steps": total, "elapsed_seconds": round(elapsed)}
+            if total and n:
+                out["percent"] = min(100, round(100 * n / total))
+                out["remaining_seconds"] = round(elapsed * (total - n) / n)
+            return out
+    for line in reversed(lines):
+        match = STEP_LINE_RE.search(line)
+        if match and int(match["total"]) > 0:
+            n, total = int(match["n"]), int(match["total"])
+            return {"found": True, "source": "log_line", "step": n,
+                    "total_steps": total,
+                    "percent": min(100, round(100 * n / total)),
+                    "remaining_seconds": None}
+    return {}
+
+
 def parse_progress(raw: str) -> dict[str, Any]:
     """
     Extract training progress from a kernel log.
@@ -151,7 +196,7 @@ def parse_progress(raw: str) -> dict[str, Any]:
     text = log_text(raw)
     segments = [seg for seg in re.split(r"[\r\n]+", text) if seg.strip()]
 
-    bars = []
+    bars, labeled = [], []
     for seg in segments:
         match = TQDM_RE.search(seg)
         if not match:
@@ -161,9 +206,13 @@ def parse_progress(raw: str) -> dict[str, Any]:
         unit_ok = re.search(r"(it/s|s/it)", seg[match.end():])
         # The first frame of a bar has no rate yet ("<?").
         unit_ok = unit_ok or "<?" in seg
-        if label.strip() or not unit_ok:
+        if not unit_ok:
             continue
-        bars.append(match.groupdict())
+        if not label.strip():
+            bars.append(match.groupdict())
+        elif not DATA_BAR_RE.search(label):
+            labeled.append(match.groupdict())
+    bars = bars or labeled
 
     lines = [seg for seg in segments if not TQDM_RE.search(seg)]
     progress: dict[str, Any] = {"found": False, "tail": lines[-8:]}
@@ -179,6 +228,8 @@ def parse_progress(raw: str) -> dict[str, Any]:
             "elapsed_seconds": _clock_to_seconds(bar["elapsed"]),
             "remaining_seconds": _clock_to_seconds(bar["remaining"]),
         })
+    else:
+        progress.update(_progress_from_lines(lines))
 
     epochs = re.findall(r"'epoch':\s*'?([\d.]+)", text)
     if epochs:
@@ -344,6 +395,17 @@ class KernelExecutor(KaggleExecutor):
                 f"kernel directory ({code_file})."
             )
 
+        # AgentRun groups W&B runs by KERNEL_SLUG; the W&B tools look up the metadata slug.
+        slug = metadata["id"].split("/")[-1]
+        match = re.search(r"^KERNEL_SLUG\s*=\s*[\"']([^\"']*)[\"']",
+                          code_file.read_text(encoding="utf-8"), re.M)
+        if match and match.group(1) != slug:
+            raise ValueError(
+                f"KERNEL_SLUG in {metadata['code_file']} is "
+                f"'{match.group(1)}' but the metadata slug is '{slug}'. "
+                f"Set KERNEL_SLUG = \"{slug}\"."
+            )
+
         return metadata
 
     def init(self):
@@ -366,15 +428,27 @@ class KernelExecutor(KaggleExecutor):
         accelerator: str = None,
         timeout: int = None,
         no_run: bool = None,
+        code_override: str | None = None,
     ):
         kernel_path = Path(self.kernel_path).resolve()
 
         if not kernel_path.is_dir():
             raise NotADirectoryError(str(kernel_path))
 
-        self.validate_for_push()
+        self.write_metadata({})  # adds the keys dataset if missing
+        metadata = self.validate_for_push()
 
-        command = ["kernels", "push", "-p", kernel_path]
+        push_path = kernel_path
+        if code_override is not None:
+            # Push a build copy so the agent's own train.py stays as written.
+            push_path = kernel_path / ".push_build"
+            shutil.rmtree(push_path, ignore_errors=True)
+            code_path = push_path / metadata["code_file"]
+            code_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(self.metadata_path, push_path / self.metadata_path.name)
+            code_path.write_text(code_override, encoding="utf-8")
+
+        command = ["kernels", "push", "-p", push_path]
 
         if accelerator is not None:
             command.extend(["--accelerator", accelerator])
@@ -582,6 +656,8 @@ class KernelExecutor(KaggleExecutor):
         for key in remove_keys or []:
             metadata.pop(key, None)
 
+        _add_keys_source(metadata)
+
         normalize_bools(metadata)
         metadata_path = self.metadata_path
 
@@ -614,11 +690,17 @@ class DatasetExecutor(KaggleExecutor):
             )
 
     def read_dataset_id(self) -> str:
-        return validate_ref(self.read_metadata().get("id"), "Dataset")
+        ref = validate_ref(self.read_metadata().get("id"), "Dataset")
+        if ref == KEYS_DATASET:
+            raise ValueError(
+                f"{KEYS_DATASET} holds API keys and is off-limits to the "
+                "dataset tools. Only attach it via dataset_sources."
+            )
+        return ref
 
     def _validate_for_upload(self):
         metadata = self._validate_metadata()
-        validate_ref(metadata.get("id"), "Dataset")
+        self.read_dataset_id()
         placeholders = find_placeholders(metadata, ("id", "title"))
         if placeholders:
             raise ValueError(

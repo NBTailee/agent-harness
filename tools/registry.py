@@ -1,7 +1,53 @@
 from tools import tools, skills, todos
+from tools.agents.agent_registry import AGENTS
+from tools.agents.subagent import run_subagent
+
+available_agents_name = []
+available_agents = ""
+
+for k, v in AGENTS.items():
+    available_agents_name.append(f"{k}")
+    available_agents += f"\n\n - {k}: {v.description}"
 
 
 TOOL_REGISTRY = {
+    "delegate_task": {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "delegate_task",
+                "description": (
+                    "Delegate a task to a specialized sub-agent. It runs its "
+                    "own agent loop with the same sandbox, Kaggle kernel and "
+                    "W&B project, and returns only its final answer. It does "
+                    "not see this conversation: put every needed detail "
+                    "(goal, files, ids, constraints, expected output) in "
+                    f"task.\n\nAvailable agents:{available_agents}"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_name": {
+                            "type": "string",
+                            "enum": available_agents_name
+                        },
+                        "task": {
+                            "type": "string",
+                            "description": "Detailed task for the sub-agent."
+                        }
+                    },
+                    "required": [
+                        "agent_name",
+                        "task"
+                    ],
+                    "additionalProperties": False
+                }
+            },
+        },
+
+        "function": run_subagent
+    },
+
     # "bash": {
     #     "schema": {
     #         "type": "function",
@@ -81,7 +127,11 @@ TOOL_REGISTRY = {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create, overwrite, append to, or partially edit a project file.",
+                "description": (
+                    "Create, overwrite, append to, or partially edit a project file. "
+                    "Always pass `operation`. 'write' and 'append' need `content`; "
+                    "'replace' needs `old_text` and `new_text`."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -101,14 +151,15 @@ TOOL_REGISTRY = {
                             "type": "string",
                             "enum": ["write", "replace", "append"],
                             "description": (
-                                "The file operation to perform. "
-                                "Defaults to 'write'."
+                                "write: create/overwrite with content. "
+                                "append: add content to the end. "
+                                "replace: swap old_text for new_text."
                             ),
-                            "default": "write"
                         },
 
                         "content": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "The text for 'write' or 'append' (required for them).",
                         },
                         "old_text": {
                             "type": "string"
@@ -118,9 +169,13 @@ TOOL_REGISTRY = {
                         },
                         "replace_many": {
                             "type": "boolean"
+                        },
+                        "allow_empty": {
+                            "type": "boolean",
+                            "description": "Only to create an empty file on purpose; otherwise empty content is refused."
                         }
                     },
-                    "required": ["path"]
+                    "required": ["path", "operation"]
                 }
             }
         },
@@ -308,6 +363,10 @@ TOOL_REGISTRY = {
                         "no_run": {
                             "type": "boolean",
                             "description": "Push without executing the kernel.",
+                        },
+                        "force": {
+                            "type": "boolean",
+                            "description": "Push even if train.py is unchanged since the last push (a deliberate re-run).",
                         },
                     },
                     "required": [],
@@ -567,6 +626,301 @@ TOOL_REGISTRY = {
             },
         },
         "function": tools.kaggle_get_output_log,
+    },
+
+    "wandb_training_metrics": {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "wandb_training_metrics",
+                "description": (
+                    "Live W&B metrics of the current kernel's latest run "
+                    "(any framework that uses AgentRun): loss and metric "
+                    "curves, best point, and a fit verdict (healthy, "
+                    "warming_up, overfit, underfit, diverged) with an "
+                    "action (continue, stop_and_edit, let_finish, "
+                    "final_only), suggested_edits and "
+                    "suggested_wait_seconds. Use while the kernel is "
+                    "RUNNING, next to kaggle_training_progress."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "last_n": {
+                            "type": "integer",
+                            "description": "Points per curve (1-50). Default 10.",
+                        },
+                        "chance_level": {
+                            "type": ["number", "null"],
+                            "description": (
+                                "Metric value of a random guess, e.g. 0.5 "
+                                "for balanced binary accuracy."
+                            ),
+                        },
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "function": tools.wandb_training_metrics,
+    },
+
+    "wandb_stop_training": {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "wandb_stop_training",
+                "description": (
+                    "Stop the running Kaggle training early to save GPU "
+                    "time. Use only when wandb_training_metrics returns "
+                    "action 'stop_and_edit'. train.py stops within about "
+                    "30 seconds and keeps the best checkpoint."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": (
+                                "Verdict and evidence, e.g. 'overfit: eval "
+                                "loss up for 3 evals'."
+                            ),
+                        },
+                    },
+                    "required": ["reason"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "function": tools.wandb_stop_training,
+    },
+
+    "wandb_compare_runs": {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "wandb_compare_runs",
+                "description": (
+                    "Rank W&B training runs by a metric (default: the "
+                    "run's primary_metric) and return the best run with "
+                    "its hyperparameters, framework and URL."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "metric": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "e.g. eval/accuracy, eval/rmse. Null uses "
+                                "the primary_metric."
+                            ),
+                        },
+                        "goal": {
+                            "type": ["string", "null"],
+                            "enum": ["max", "min", None],
+                            "description": "Null uses the run's goal.",
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Rows to return (1-20). Default 5.",
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["kernel", "project"],
+                            "description": (
+                                "project: every run in the active project, "
+                                "incl. host-recorded baselines (default). "
+                                "kernel: runs of the current kernel only."
+                            ),
+                        },
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "function": tools.wandb_compare_runs,
+    },
+
+    "wandb_sync_kaggle_run": {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "wandb_sync_kaggle_run",
+                "description": (
+                    "Upload offline W&B runs (train.py printed "
+                    "WANDB_OFFLINE) from the downloaded kernel output. "
+                    "Call after kaggle_download_output_files."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "function": tools.wandb_sync_kaggle_run,
+    },
+
+    "wandb_list_projects": {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "wandb_list_projects",
+                "description": (
+                    "List the W&B projects of entity leductai2201 (fixed) "
+                    "and show which one is active. The other wandb_* tools "
+                    "use the active project."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "function": tools.wandb_list_projects,
+    },
+
+    "wandb_create_project": {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "wandb_create_project",
+                "description": (
+                    "Create a new W&B project under leductai2201 and make "
+                    "it the active project. Then set WANDB_PROJECT in "
+                    "train.py to the same name."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Project name: letters, digits, '-', '_' or "
+                                "'.', e.g. sst2-distilbert."
+                            ),
+                        },
+                    },
+                    "required": ["name"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "function": tools.wandb_create_project,
+    },
+
+    "wandb_use_project": {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "wandb_use_project",
+                "description": (
+                    "Switch the active W&B project to an existing one. "
+                    "Then set WANDB_PROJECT in train.py to the same name."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Existing project name.",
+                        },
+                    },
+                    "required": ["name"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "function": tools.wandb_use_project,
+    },
+
+    "wandb_list_runs": {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "wandb_list_runs",
+                "description": (
+                    "List runs of a W&B project, newest first: id, name, "
+                    "state, group, framework, primary metric value, tags, URL."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "project": {
+                            "type": ["string", "null"],
+                            "description": "Project name. Null = active project.",
+                        },
+                        "group": {
+                            "type": ["string", "null"],
+                            "description": "Only runs of this group (a kernel slug).",
+                        },
+                        "state": {
+                            "type": ["string", "null"],
+                            "enum": ["running", "finished", "crashed",
+                                     "failed", "killed", None],
+                            "description": "Only runs in this state.",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max runs (1-100). Default 20.",
+                        },
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "function": tools.wandb_list_runs,
+    },
+
+    "wandb_create_run": {
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "wandb_create_run",
+                "description": (
+                    "Create a finished W&B run from the host to record "
+                    "results that did not come from an AgentRun kernel, "
+                    "e.g. a baseline, a local evaluation or an experiment "
+                    "note. Training runs on Kaggle create their own runs."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Run name."},
+                        "project": {
+                            "type": ["string", "null"],
+                            "description": "Project name. Null = active project.",
+                        },
+                        "config": {
+                            "type": ["object", "null"],
+                            "description": "Hyperparameters / settings.",
+                        },
+                        "metrics": {
+                            "type": ["object", "null"],
+                            "description": (
+                                "Final metrics written to the run summary, "
+                                "e.g. {\"eval/accuracy\": 0.91}."
+                            ),
+                        },
+                        "group": {"type": ["string", "null"]},
+                        "tags": {
+                            "type": ["array", "null"],
+                            "items": {"type": "string"},
+                        },
+                        "notes": {"type": ["string", "null"]},
+                    },
+                    "required": ["name", "metrics"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "function": tools.wandb_create_run,
     },
 
 
@@ -1169,8 +1523,22 @@ TOOL_REGISTRY = {
 
 }
 
+# Runs arbitrary Python on the host with its keys; not given to agents.
+HOST_ONLY_TOOLS = {"write_and_run_temp_file"}
+
 TOOL_SCHEMAS = [
-    item["schema"] for item in TOOL_REGISTRY.values()
+    item["schema"] for name, item in TOOL_REGISTRY.items()
+    if name not in HOST_ONLY_TOOLS
+]
+
+# Running and monitoring kernels belongs to the experiment-scientist sub-agent.
+EXPERIMENT_TOOLS = {
+    "kaggle_init", "write_kaggle_metadata", "kaggle_push", "kaggle_delete",
+    "kaggle_training_progress", "wandb_training_metrics",
+    "wandb_stop_training", "wandb_sync_kaggle_run",
+}
+MAIN_TOOL_SCHEMAS = [
+    t for t in TOOL_SCHEMAS if t["function"]["name"] not in EXPERIMENT_TOOLS
 ]
 
 
